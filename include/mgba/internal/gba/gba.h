@@ -131,7 +131,7 @@ struct GBA {
 	uint32_t externalFsOffset;
 	uint16_t externalFsSize;
 	uint32_t externalFsOutAddress;
-	bool externalFsOutSuccess;
+	uint16_t externalFsOutSuccess;
 };
 
 struct GBACartridge {

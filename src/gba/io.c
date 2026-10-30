@@ -16,6 +16,12 @@ mLOG_DEFINE_CATEGORY(GBA_IO, "GBA I/O", "gba.io");
 #include <mgba-util/vfs.h>
 #include <mgba/core/core.h>
 
+enum {
+	CMD_READ_FILE,
+	CMD_GET_SIZE,
+	CMD_READ_DIR,
+};
+
 static void _ReadExternalFile(struct GBA* gba) {
 	struct ARMCore* cpu = gba->cpu;
 	uint32_t filenamePtr = gba->externalFsFilename;
@@ -31,6 +37,8 @@ static void _ReadExternalFile(struct GBA* gba) {
 			break;
 	}
 	filename[i] = '\0';
+	if (filename[0] == '/')
+		memmove(filename, filename + 1, strlen(filename));
 
 	mLOG(GBA_IO, DEBUG,
 		 "ReadExternalFile: filename='%s', offset=%u, size=%u, dest=%08X",
@@ -97,6 +105,81 @@ static void _ReadExternalFile(struct GBA* gba) {
 	gba->externalFsSize = totalRead;
 	gba->externalFsOutSuccess = true;
 	mLOG(GBA_IO, DEBUG, "ReadExternalFile: Read %u bytes", totalRead);
+}
+
+static void _ReadExternalDirectory(struct GBA* gba) {
+	struct ARMCore* cpu = gba->cpu;
+	uint32_t dirnamePtr = gba->externalFsFilename;
+	uint32_t index = gba->externalFsOffset;
+	uint32_t size = gba->externalFsSize;
+	uint32_t destPtr = gba->externalFsOutAddress;
+
+	char dirname[256];
+	int i;
+	for (i = 0; i < 255; i++) {
+		dirname[i] = cpu->memory.load8(cpu, dirnamePtr + i, 0);
+		if (dirname[i] == '\0')
+			break;
+	}
+	dirname[i] = '\0';
+	if (dirname[0] == '/')
+		memmove(dirname, dirname + 1, strlen(dirname));
+	if (!dirname[0])
+		strcpy(dirname, ".");
+
+	mLOG(GBA_IO, DEBUG,
+		 "ReadExternalDirectory: dirname='%s', index=%u, size=%u, dest=%08X",
+		 dirname, index, size, destPtr);
+
+	struct VDir* vd = VDirOpen(dirname);
+	if (!vd) {
+		mLOG(GBA_IO, WARN, "ReadExternalDirectory: Failed to open directory '%s'", dirname);
+		gba->externalFsOutSuccess = false;
+		return;
+	}
+	if (!size || !destPtr) {
+		mLOG(GBA_IO, WARN,
+			 "ReadExternalDirectory: Invalid output buffer (size=%u, dest=%08X)",
+			 size, destPtr);
+		vd->close(vd);
+		gba->externalFsOutSuccess = false;
+		return;
+	}
+
+	struct VDirEntry* entry;
+	uint32_t current = 0;
+	while ((entry = vd->listNext(vd))) {
+		const char* name = entry->name(entry);
+		if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+			continue;
+		}
+		if (current++ == index) {
+			break;
+		}
+	}
+
+	if (!entry) {
+		mLOG(GBA_IO, DEBUG, "ReadExternalDirectory: No entry at index %u", index);
+		vd->close(vd);
+		gba->externalFsOutSuccess = false;
+		return;
+	}
+
+	const char* name = entry->name(entry);
+	uint32_t length = strlen(name);
+	if (length >= size) {
+		length = size - 1;
+	}
+
+	for (uint32_t j = 0; j < length; j++) {
+		cpu->memory.store8(cpu, destPtr + j, name[j], 0);
+	}
+	cpu->memory.store8(cpu, destPtr + length, 0, 0);
+
+	gba->externalFsOutSuccess = entry->type(entry) == VFS_DIRECTORY ? 2 : 1;
+	mLOG(GBA_IO, DEBUG, "ReadExternalDirectory: Read entry '%s' (type=%u)",
+		 name, gba->externalFsOutSuccess);
+	vd->close(vd);
 }
 
 const char* const GBAIORegisterNames[] = {
@@ -670,7 +753,18 @@ void GBAIOWrite(struct GBA* gba, uint32_t address, uint16_t value) {
 		return;
 	case GBA_REG_FS_OUT_SUCCESS:
 		gba->externalFsOutSuccess = false;
-		_ReadExternalFile(gba);
+		switch (value) {
+		case CMD_READ_FILE:
+			_ReadExternalFile(gba);
+			break;
+		case CMD_GET_SIZE:
+			gba->externalFsOutAddress = 0;
+			_ReadExternalFile(gba);
+			break;
+		case CMD_READ_DIR:
+			_ReadExternalDirectory(gba);
+			break;
+		}
 		return;
 	case GBA_REG_DEBUG_FLAGS:
 		if (gba->debug) {

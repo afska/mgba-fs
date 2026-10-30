@@ -4,7 +4,8 @@ mGBA fork with filesystem support
 This mGBA fork lets homebrew ROMs read files.
 
 - The games request **files**, not blocks. The emulator doesn't simulate a block device.
-- Maximum size per read operation is **65535**. Files can have any size.
+- Maximum size per read operation is **65535**.
+- Maximum file size is **4294967294**.
 - Paths are based on the **working directory**, not the **ROM directory**.
 
 ## Example usage on the GBA side
@@ -20,68 +21,109 @@ This mGBA fork lets homebrew ROMs read files.
 #define REG_FS_OUT_ADDRESS_HI (*(volatile unsigned short*)0x4FFF80E)
 #define REG_FS_OUT_SUCCESS (*(volatile unsigned short*)0x4FFF810)
 
-inline unsigned enableFS() {
-	REG_FS_ENABLE = 0xF511;
-	return REG_FS_ENABLE == 0x11F5;
+#define MGBAFS_CMD_READ_FILE 0
+#define MGBAFS_CMD_GET_SIZE 1
+#define MGBAFS_CMD_READ_DIR 2
+
+#define MGBAFS_FS_ENTRY_NONE 0
+#define MGBAFS_FS_ENTRY_FILE 1
+#define MGBAFS_FS_ENTRY_DIRECTORY 2
+
+#define MGBAFS_MAX_READ_LENGTH 65535
+
+inline unsigned mgbafs_enable() {
+  REG_FS_ENABLE = 0xF511;
+  return REG_FS_ENABLE == 0x11F5;
 }
 
-inline int readFile(
-	const char* fileName,
-	unsigned offset,
-	unsigned short size,
-	unsigned char* dest
-) {
-	if (!enableFS())
-		return -1;
+inline int mgbafs_read_file(const char* file_name,
+                            unsigned offset,
+                            unsigned short size,
+                            unsigned char* dest) {
+  if (!mgbafs_enable())
+    return -1;
 
-	REG_FS_FILENAME_LO = (unsigned)fileName & 0xffff;
-	REG_FS_FILENAME_HI = (unsigned)fileName >> 16;
-	REG_FS_OFFSET_LO = offset & 0xffff;
-	REG_FS_OFFSET_HI = offset >> 16;
-	REG_FS_SIZE = size;
-	REG_FS_OUT_ADDRESS_LO = (unsigned)dest & 0xffff;
-	REG_FS_OUT_ADDRESS_HI = (unsigned)dest >> 16;
-	REG_FS_OUT_SUCCESS = 0; // (this write starts the read process)
+  REG_FS_FILENAME_LO = (unsigned)file_name & 0xffff;
+  REG_FS_FILENAME_HI = (unsigned)file_name >> 16;
+  REG_FS_OFFSET_LO = offset & 0xffff;
+  REG_FS_OFFSET_HI = offset >> 16;
+  REG_FS_SIZE = size;
+  REG_FS_OUT_ADDRESS_LO = (unsigned)dest & 0xffff;
+  REG_FS_OUT_ADDRESS_HI = (unsigned)dest >> 16;
+  REG_FS_OUT_SUCCESS = MGBAFS_CMD_READ_FILE;  // (this write starts the read process)
 
-	// (returns the number of read bytes, or -1)
-	return REG_FS_OUT_SUCCESS == 1
-		? REG_FS_SIZE
-		: -1;
+  // (returns the number of read bytes, or -1)
+  return REG_FS_OUT_SUCCESS == 1 ? REG_FS_SIZE : -1;
 }
 
-inline int getFileSize(const char* fileName) {
-	if (!enableFS())
-		return -1;
+inline unsigned mgbafs_get_file_size(const char* file_name) {
+  if (!mgbafs_enable())
+    return 0xFFFFFFFF;
 
-	REG_FS_FILENAME_LO = (unsigned)fileName & 0xffff;
-	REG_FS_FILENAME_HI = (unsigned)fileName >> 16;
-	REG_FS_OFFSET_LO = 0;
-	REG_FS_OFFSET_HI = 0;
-	REG_FS_SIZE = 0;
-	REG_FS_OUT_ADDRESS_LO = 0; // (`address == 0` means "retrieve file size")
-	REG_FS_OUT_ADDRESS_HI = 0;
-	REG_FS_OUT_SUCCESS = 0;
+  REG_FS_FILENAME_LO = (unsigned)file_name & 0xffff;
+  REG_FS_FILENAME_HI = (unsigned)file_name >> 16;
+  REG_FS_OFFSET_LO = 0;
+  REG_FS_OFFSET_HI = 0;
+  REG_FS_SIZE = 0;
+  REG_FS_OUT_SUCCESS = MGBAFS_CMD_GET_SIZE;
 
-	return REG_FS_OUT_SUCCESS == 1
-		? (REG_FS_OUT_ADDRESS_HI << 16) | REG_FS_OUT_ADDRESS_LO
-		: -1;
+  return REG_FS_OUT_SUCCESS == 1
+             ? ((unsigned)REG_FS_OUT_ADDRESS_HI << 16) | REG_FS_OUT_ADDRESS_LO
+             : 0xFFFFFFFF;
+}
+
+inline int mgbafs_read_directory(const char* directory,
+                                 unsigned index,
+                                 char* name,
+                                 unsigned short name_size) {
+  if (!mgbafs_enable() || name_size == 0)
+    return MGBAFS_FS_ENTRY_NONE;
+
+  REG_FS_FILENAME_LO = (unsigned)directory & 0xffff;
+  REG_FS_FILENAME_HI = (unsigned)directory >> 16;
+  REG_FS_OFFSET_LO = index & 0xffff;
+  REG_FS_OFFSET_HI = index >> 16;
+  REG_FS_SIZE = name_size;
+  REG_FS_OUT_ADDRESS_LO = (unsigned)name & 0xffff;
+  REG_FS_OUT_ADDRESS_HI = (unsigned)name >> 16;
+  REG_FS_OUT_SUCCESS = MGBAFS_CMD_READ_DIR;
+
+  return REG_FS_OUT_SUCCESS;
 }
 ```
 
 To read the first 100 bytes of a file:
 
 ```cpp
-if (enableFS()) {
+if (mgbafs_enable()) {
 	unsigned char bytes[100];
-	int readBytes = readFile("hello.txt", 0, 100, bytes);
+	int bytes_read = mgbafs_read_file("hello.txt", 0, 100, bytes);
 }
 ```
 
 To retrieve the size of a file:
 
 ```cpp
-if (enableFS()) {
-	int fileSize = getFileSize("hello.txt");
+if (mgbafs_enable()) {
+	unsigned file_size = mgbafs_get_file_size("hello.txt");
+}
+```
+
+To list a directory:
+
+```cpp
+if (mgbafs_enable()) {
+	char name[256];
+	for (unsigned index = 0; ; index++) {
+		int type = mgbafs_read_directory(".", index, name, sizeof(name));
+		if (type == MGBAFS_FS_ENTRY_NONE)
+			break;
+
+		if (type == MGBAFS_FS_ENTRY_DIRECTORY)
+			onDirectory(name);
+		else
+			onFile(name);
+	}
 }
 ```
 
@@ -90,7 +132,6 @@ if (enableFS()) {
 ```bash
 docker run --rm -it -v ${PWD}:/home/mgba/src mgba/windows:w64
 docker run --rm -it -v ${PWD}:/home/mgba/src mgba/appimage:x64
-docker run --rm -it -v ${PWD}:/home/mgba/src mgba/appimage:arm64
 ```
 
 mGBA
